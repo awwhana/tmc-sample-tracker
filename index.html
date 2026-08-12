@@ -224,6 +224,12 @@
 
   .loading-state { text-align: center; padding: 60px; color: var(--ink-soft); font-family: 'IBM Plex Mono', monospace; }
 
+  .sync-status { display:inline-flex; align-items:center; gap:6px; font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--ink-soft); margin-top:5px; justify-content:flex-end; }
+  .sync-dot { width:7px; height:7px; border-radius:50%; background:#999; display:inline-block; }
+  .sync-status.online .sync-dot { background:#2e7d32; }
+  .sync-status.syncing .sync-dot { background:var(--ab-orange); }
+  .sync-status.error .sync-dot { background:var(--thread-alert); }
+
   .stat-mini { display: flex; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
   .stat-mini .mini-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; min-width: 120px; border-top: 3px solid var(--ab-gold); }
   .stat-mini .mini-num { font-family: 'Oswald', sans-serif; font-size: 22px; font-weight: 600; color: var(--ab-red-deep); }
@@ -236,6 +242,11 @@
   .bar-fill { height: 100%; background: linear-gradient(90deg, var(--ab-red), var(--ab-orange)); }
   .bar-value { width: 40px; text-align: right; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--ink-soft); }
 </style>
+
+<!-- Firebase (used for shared multi-user storage) -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 </head>
 <body>
 
@@ -246,11 +257,13 @@
     <div class="title-block">
       <h1>TMC Sample Tracker</h1>
       <div class="subtitle">Technology Management Centre · live sample status board</div>
+      <div class="subtitle" style="margin-top:3px;">Shared mode · real-time team sync</div>
     </div>
   </div>
   <div>
     <div class="date-stamp" id="dateStamp"></div>
     <label class="reminder-toggle"><input type="checkbox" id="reminderToggle"> 🔔 Remind me for 5 PM report</label>
+    <div class="sync-status" id="syncStatus"><span class="sync-dot"></span><span id="syncStatusText">Connecting…</span></div>
   </div>
 </header>
 
@@ -499,8 +512,26 @@ const STAGES = [
 const STAGE_INDEX = Object.fromEntries(STAGES.map((s,i)=>[s.key,i]));
 const DELAY_REASONS = ['Fabric unavailable','Pattern pending','Machine issue','Design revision','Trim delay'];
 const DELAY_THRESHOLD_HOURS = 48;
-const STORAGE_KEY = 'tmc-samples-v2';
+// ---------------------------------------------------------------------------
+// SHARED DATABASE CONFIG
+// 1) Create a Firebase project at https://console.firebase.google.com/
+// 2) Enable Authentication > Sign-in method > Anonymous
+// 3) Create a Firestore database
+// 4) Register a Web App and paste its config below
+// 5) Publish this HTML file. Every person opening the same published URL will
+//    then see and edit the same tracker data in real time.
+// ---------------------------------------------------------------------------
+const FIREBASE_CONFIG = {
+  apiKey: "PASTE_YOUR_FIREBASE_API_KEY",
+  authDomain: "PASTE_YOUR_PROJECT.firebaseapp.com",
+  projectId: "PASTE_YOUR_PROJECT_ID",
+  storageBucket: "PASTE_YOUR_PROJECT.firebasestorage.app",
+  messagingSenderId: "PASTE_YOUR_SENDER_ID",
+  appId: "PASTE_YOUR_APP_ID"
+};
 
+const FIRESTORE_COLLECTION = 'tmcSamples';
+let firebaseReady = false;
 let samples = [];
 let activeUpdateId = null;
 let askFilterSet = null;
@@ -519,28 +550,84 @@ function setDateStamp() {
   $('dateStamp').textContent = now.toLocaleDateString('en-IN', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
 }
 
-async function loadSamples() {
-  try {
-    const res = await window.storage.get(STORAGE_KEY, true);
-    samples = res && res.value ? JSON.parse(res.value) : [];
-  } catch (e) {
-    samples = [];
-  }
-  samples.forEach(s => {
-    if (!s.stageLog) s.stageLog = [{ stage: s.stage, enteredAt: s.stageUpdatedAt || s.createdAt }];
-    if (!s.delayEvents) s.delayEvents = [];
-    if (!s.revisionEvents) s.revisionEvents = [];
-    if (s.actualCompletion === undefined) s.actualCompletion = null;
-    if (s.expectedCompletion === undefined) s.expectedCompletion = '';
-  });
-  render();
+function normalizeSample(s) {
+  if (!s.stageLog) s.stageLog = [{ stage: s.stage, enteredAt: s.stageUpdatedAt || s.createdAt }];
+  if (!s.delayEvents) s.delayEvents = [];
+  if (!s.revisionEvents) s.revisionEvents = [];
+  if (s.actualCompletion === undefined) s.actualCompletion = null;
+  if (s.expectedCompletion === undefined) s.expectedCompletion = '';
+  return s;
 }
 
-async function saveSamples() {
+function setSyncStatus(state, text) {
+  const el = $('syncStatus');
+  const txt = $('syncStatusText');
+  if (!el || !txt) return;
+  el.className = 'sync-status ' + state;
+  txt.textContent = text;
+}
+
+async function initSharedDatabase() {
+  const configured = FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.startsWith('PASTE_') &&
+    FIREBASE_CONFIG.projectId && !FIREBASE_CONFIG.projectId.startsWith('PASTE_');
+  if (!configured) {
+    setSyncStatus('error', 'Firebase setup required');
+    samples = [];
+    render();
+    showToast('Paste your Firebase Web App config into this file first');
+    return;
+  }
+
   try {
-    await window.storage.set(STORAGE_KEY, JSON.stringify(samples), true);
+    if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+    await firebase.auth().signInAnonymously();
+    firebaseReady = true;
+    setSyncStatus('syncing', 'Connecting to shared tracker…');
+
+    firebase.firestore().collection(FIRESTORE_COLLECTION)
+      .onSnapshot(snapshot => {
+        samples = snapshot.docs.map(doc => normalizeSample({ id: doc.id, ...doc.data() }));
+        samples.sort((a,b) => (b.createdAt || 0) - (a.createdAt || 0));
+        render();
+        setSyncStatus('online', 'Live · shared with team');
+      }, err => {
+        console.error(err);
+        setSyncStatus('error', 'Sync error');
+        showToast('⚠ Shared database connection failed');
+      });
   } catch (e) {
+    console.error(e);
+    setSyncStatus('error', 'Firebase login failed');
+    showToast('⚠ Firebase setup/login failed');
+  }
+}
+
+async function saveSample(sample) {
+  if (!firebaseReady || !sample) return;
+  try {
+    setSyncStatus('syncing', 'Saving…');
+    await firebase.firestore().collection(FIRESTORE_COLLECTION).doc(sample.id).set({
+      ...sample,
+      updatedAt: Date.now()
+    }, { merge: true });
+    setSyncStatus('online', 'Live · shared with team');
+  } catch (e) {
+    console.error(e);
+    setSyncStatus('error', 'Save failed');
     showToast('⚠ Could not save — check connection');
+  }
+}
+
+async function deleteSample(id) {
+  if (!firebaseReady || !id) return;
+  try {
+    setSyncStatus('syncing', 'Deleting…');
+    await firebase.firestore().collection(FIRESTORE_COLLECTION).doc(id).delete();
+    setSyncStatus('online', 'Live · shared with team');
+  } catch (e) {
+    console.error(e);
+    setSyncStatus('error', 'Delete failed');
+    showToast('⚠ Could not delete — check connection');
   }
 }
 
@@ -707,7 +794,7 @@ async function saveNewIndent() {
   });
   closeNewIndent();
   render();
-  await saveSamples();
+  await saveSample(samples.find(x => x.indentNo.toLowerCase() === indentNo.toLowerCase()));
   showToast(`Indent ${indentNo} created`);
 }
 
@@ -810,7 +897,7 @@ async function onSealClickUpdate(e) {
   sample.stageLog.push({ stage, enteredAt: now });
   if (stage === 'dispatch' && !sample.actualCompletion) sample.actualCompletion = now;
   render();
-  await saveSamples();
+  await saveSample(sample);
   showToast(`${sample.indentNo} → ${STAGES.find(st=>st.key===stage).label}`);
   showRecord(id);
 }
@@ -821,7 +908,7 @@ async function saveCommentsOnly() {
   if (!sample) return;
   sample.comments = $('u_comments').value.trim();
   render();
-  await saveSamples();
+  await saveSample(sample);
   showToast('Update saved');
 }
 
@@ -830,7 +917,7 @@ async function logDelayReason(id) {
   if (!sample) return;
   const reason = $('u_delayReason').value;
   sample.delayEvents.push({ stage: sample.stage, reason, loggedAt: Date.now() });
-  await saveSamples();
+  await saveSample(sample);
   showToast('Delay reason logged');
   showRecord(id);
 }
@@ -841,7 +928,7 @@ async function markRevision(id) {
   const note = window.prompt('Brief note on the revision requested (optional):', '');
   if (note === null) return;
   sample.revisionEvents.push({ note: note.trim(), loggedAt: Date.now() });
-  await saveSamples();
+  await saveSample(sample);
   showToast('Revision logged');
   showRecord(id);
 }
@@ -885,7 +972,7 @@ async function saveCorrection() {
   s.quantity = Number($('c_quantity').value) || 0;
   s.expectedCompletion = $('c_expectedCompletion').value || '';
   render();
-  await saveSamples();
+  await saveSample(s);
   showToast('Indent details corrected');
   closeCorrection();
   showRecord(id);
@@ -898,7 +985,7 @@ async function deleteCorrection() {
   if (!confirm(`Delete indent ${s.indentNo} permanently? This cannot be undone.`)) return;
   samples = samples.filter(x => x.id !== id);
   render();
-  await saveSamples();
+  await deleteSample(id);
   showToast('Indent deleted');
   $('correctOverlay').classList.remove('open');
   closeUpdateStatus();
@@ -1066,25 +1153,19 @@ function openReport() {
 
 async function initReminderToggle() {
   try {
-    const res = await window.storage.get('reminder-enabled', false);
-    if (res && res.value === 'true') $('reminderToggle').checked = true;
+    if (localStorage.getItem('tmc-reminder-enabled') === 'true') $('reminderToggle').checked = true;
   } catch (e) {}
 }
 
 async function checkReminderTick() {
   try {
-    const res = await window.storage.get('reminder-enabled', false);
-    if (!res || res.value !== 'true') return;
+    if (localStorage.getItem('tmc-reminder-enabled') !== 'true') return;
     const now = new Date();
     if (now.getHours() !== 17) return;
     const todayKey = now.toISOString().slice(0,10);
-    let lastFired = null;
-    try {
-      const lf = await window.storage.get('reminder-last-fired', false);
-      lastFired = lf ? lf.value : null;
-    } catch (e) { lastFired = null; }
+    const lastFired = localStorage.getItem('tmc-reminder-last-fired');
     if (lastFired === todayKey) return;
-    await window.storage.set('reminder-last-fired', todayKey, false);
+    localStorage.setItem('tmc-reminder-last-fired', todayKey);
     if ('Notification' in window && Notification.permission === 'granted') {
       new Notification('TMC Daily Report Ready', { body: "Click to open the tracker and review today's report." });
     }
@@ -1138,7 +1219,7 @@ $('filterDelayed').addEventListener('change', render);
 
 $('reminderToggle').addEventListener('change', async (e) => {
   const enabled = e.target.checked;
-  try { await window.storage.set('reminder-enabled', enabled ? 'true' : 'false', false); } catch(err) {}
+  try { localStorage.setItem('tmc-reminder-enabled', enabled ? 'true' : 'false'); } catch(err) {}
   if (enabled && 'Notification' in window && Notification.permission !== 'granted') Notification.requestPermission();
   showToast(enabled ? 'Reminder enabled — keep this tab open around 5 PM' : 'Reminder disabled');
 });
@@ -1150,8 +1231,8 @@ $('analysisOverlay').addEventListener('click', (e) => { if (e.target.id === 'ana
 $('reportOverlay').addEventListener('click', (e) => { if (e.target.id === 'reportOverlay') $('reportOverlay').classList.remove('open'); });
 
 setDateStamp();
-loadSamples();
 initReminderToggle();
+initSharedDatabase();
 setInterval(render, 60000);
 setInterval(checkReminderTick, 30000);
 </script>
